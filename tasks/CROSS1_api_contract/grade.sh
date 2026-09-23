@@ -1,11 +1,66 @@
 #!/usr/bin/env bash
 # CROSS1 grader: verify Python client matches Go server contract
-set -uo pipefail
+set -euo pipefail
 
 WORKSPACE="${1:-${WORKSPACE_DIR:-/workspace}}"
 REPORTS="${2:-${REPORTS_DIR:-/reports}}"
 SUBMISSION="${3:-/submission}"
 TASK_DIR="${4:-/task}"
+EXPECTED_JSON="${5:-$REPORTS/expected.json}"
+
+mkdir -p "$REPORTS"
+DIAGNOSTICS="$REPORTS/grader.stderr.log"
+: > "$DIAGNOSTICS"
+
+write_setup_failure() {
+    local failure_mode="$1"
+    local summary="$2"
+    python3 - "$REPORTS/score.json" "$failure_mode" "$summary" "$DIAGNOSTICS" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+score_path, failure_mode, summary, diagnostics_path = sys.argv[1:]
+diagnostics = pathlib.Path(diagnostics_path).read_text(encoding="utf-8", errors="replace")
+score = {
+    "pass": False,
+    "primary": {"success": 0},
+    "secondary": {"partial_score": 0.0, "checks_passed": 0, "total_checks": 10},
+    "failure_modes": [failure_mode],
+    "grader_stderr": diagnostics,
+    "setup_error": summary,
+}
+pathlib.Path(score_path).write_text(json.dumps(score, indent=2) + "\n", encoding="utf-8")
+PYEOF
+    exit 1
+}
+
+# uv-created environments can omit pip. When the declared test dependencies are absent, bootstrap
+# pip and install them strictly. Always preflight Python and Go before candidate checks are scored.
+if ! python3 -c "import pytest, requests" >>"$DIAGNOSTICS" 2>&1; then
+    if ! python3 -m ensurepip --upgrade >>"$DIAGNOSTICS" 2>&1; then
+        write_setup_failure "python_dependency_setup_failed" "python3 -m ensurepip failed"
+    fi
+    if ! python3 -m pip install --quiet pytest requests >>"$DIAGNOSTICS" 2>&1; then
+        write_setup_failure "python_dependency_setup_failed" "pytest/requests installation failed"
+    fi
+fi
+if ! python3 -c "import pytest, requests" >>"$DIAGNOSTICS" 2>&1; then
+    write_setup_failure "python_dependency_preflight_failed" "pytest/requests import failed"
+fi
+if ! command -v go >/dev/null 2>&1; then
+    printf '%s\n' "Go compiler not found on PATH" >>"$DIAGNOSTICS"
+    write_setup_failure "go_toolchain_missing" "Go compiler is required by CROSS1"
+fi
+if ! go version >>"$DIAGNOSTICS" 2>&1; then
+    write_setup_failure "go_toolchain_preflight_failed" "go version failed"
+fi
+if [ ! -f "$EXPECTED_JSON" ]; then
+    printf '%s\n' "Seed-specific expected.json not found: $EXPECTED_JSON" >>"$DIAGNOSTICS"
+    write_setup_failure "expected_data_missing" "CROSS1 requires seed-specific expected data"
+fi
+ENTITY_CLASS=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['entity'])" "$EXPECTED_JSON")
+ID_FIELD=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1]))['field_name'])" "$EXPECTED_JSON")
 
 cd "$WORKSPACE"
 
@@ -13,6 +68,7 @@ pass=true
 partial=0
 total=10
 findings=""
+failure_modes=""
 
 check() {
     local id="$1"
@@ -23,17 +79,15 @@ check() {
         findings="${findings}{\"id\":\"${id}\",\"ok\":true,\"note\":\"${desc}\"},"
     else
         pass=false
+        failure_modes="${failure_modes}${failure_modes:+,}${id}"
         findings="${findings}{\"id\":\"${id}\",\"ok\":false,\"note\":\"${desc}\"},"
     fi
 }
 
-# Install dependencies
-pip install pytest requests 2>/dev/null || true
-
 # -------------------------------------------------------------------
 # C1: Go server compiles (do not change Go source)
 # -------------------------------------------------------------------
-if (cd service && go build ./... 2>/dev/null); then
+if (cd service && go build ./... 2>>"$DIAGNOSTICS"); then
     check "C1" "Go server compiles successfully" "pass"
 else
     check "C1" "Go server failed to compile" "fail"
@@ -42,7 +96,7 @@ fi
 # -------------------------------------------------------------------
 # C2: Python client imports without error
 # -------------------------------------------------------------------
-if python3 -c "from client.api import APIClient; from client.models import User; from client.exceptions import APIError, parse_error_response" 2>/dev/null; then
+if EXPECTED_ENTITY="$ENTITY_CLASS" python3 -c "import os; from client.api import APIClient; import client.models as models; getattr(models, os.environ['EXPECTED_ENTITY']); from client.exceptions import APIError, parse_error_response" 2>>"$DIAGNOSTICS"; then
     check "C2" "Python client imports without error" "pass"
 else
     check "C2" "Python client import failed" "fail"
@@ -51,7 +105,7 @@ fi
 # -------------------------------------------------------------------
 # C3: test_integration.py passes (end-to-end client-server)
 # -------------------------------------------------------------------
-if python3 -m pytest tests/test_integration.py -q --tb=no 2>/dev/null | grep -q "passed"; then
+if python3 -m pytest tests/test_integration.py -q --tb=no 2>>"$DIAGNOSTICS" | grep -q "passed"; then
     check "C3" "Integration tests pass (test_integration.py)" "pass"
 else
     check "C3" "Integration tests failed (test_integration.py)" "fail"
@@ -60,7 +114,7 @@ fi
 # -------------------------------------------------------------------
 # C4: test_pagination.py passes
 # -------------------------------------------------------------------
-if python3 -m pytest tests/test_pagination.py -q --tb=no 2>/dev/null | grep -q "passed"; then
+if python3 -m pytest tests/test_pagination.py -q --tb=no 2>>"$DIAGNOSTICS" | grep -q "passed"; then
     check "C4" "Pagination tests pass (test_pagination.py)" "pass"
 else
     check "C4" "Pagination tests failed (test_pagination.py)" "fail"
@@ -69,41 +123,42 @@ fi
 # -------------------------------------------------------------------
 # C5: test_errors.py passes
 # -------------------------------------------------------------------
-if python3 -m pytest tests/test_errors.py -q --tb=no 2>/dev/null | grep -q "passed"; then
+if python3 -m pytest tests/test_errors.py -q --tb=no 2>>"$DIAGNOSTICS" | grep -q "passed"; then
     check "C5" "Error handling tests pass (test_errors.py)" "pass"
 else
     check "C5" "Error handling tests failed (test_errors.py)" "fail"
 fi
 
 # -------------------------------------------------------------------
-# C6: client/models.py uses camelCase userId (not snake_case user_id)
-# Check that from_dict reads "userId" key, not "user_id"
+# C6: client/models.py uses the seed-specific camelCase ID field.
 # -------------------------------------------------------------------
-if python3 - <<'PYEOF' 2>/dev/null
+if EXPECTED_ID_FIELD="$ID_FIELD" python3 - <<'PYEOF' 2>>"$DIAGNOSTICS"
 import ast, sys
+import os
+
 src = open('client/models.py').read()
-# Must have "userId" string literal somewhere in the file
-if '"userId"' in src or "'userId'" in src:
-    # Must NOT have the buggy pattern data.get("user_id") as the primary lookup
-    # We allow user_id as the python attribute name, but from_dict must map "userId"
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == 'from_dict':
-            func_src = ast.unparse(node)
-            if '"userId"' in func_src or "'userId'" in func_src:
-                sys.exit(0)
+expected_field = os.environ['EXPECTED_ID_FIELD']
+tree = ast.parse(src)
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name == 'from_dict':
+        string_values = {
+            child.value for child in ast.walk(node)
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        }
+        if expected_field in string_values:
+            sys.exit(0)
 sys.exit(1)
 PYEOF
 then
-    check "C6" "client/models.py from_dict maps camelCase 'userId' key" "pass"
+    check "C6" "client/models.py from_dict maps camelCase '${ID_FIELD}' key" "pass"
 else
-    check "C6" "client/models.py still uses snake_case 'user_id' key in from_dict" "fail"
+    check "C6" "client/models.py does not map seed-specific '${ID_FIELD}' in from_dict" "fail"
 fi
 
 # -------------------------------------------------------------------
 # C7: client/api.py parses "data" key for pagination (not "results")
 # -------------------------------------------------------------------
-if python3 - <<'PYEOF' 2>/dev/null
+if python3 - <<'PYEOF' 2>>"$DIAGNOSTICS"
 import ast, sys
 src = open('client/api.py').read()
 tree = ast.parse(src)
@@ -126,7 +181,7 @@ fi
 # C8: client/exceptions.py handles 422 status code (not just 400)
 # Check that parse_error_response actually branches on 422 AND reads "errors" key
 # -------------------------------------------------------------------
-if python3 - <<'PYEOF' 2>/dev/null
+if python3 - <<'PYEOF' 2>>"$DIAGNOSTICS"
 import ast, sys
 
 src = open('client/exceptions.py').read()
@@ -158,8 +213,9 @@ fi
 # errors array type present, userId field present.
 # Use line-by-line checks to avoid matching YAML comments.
 # -------------------------------------------------------------------
-if python3 - <<'PYEOF' 2>/dev/null
+if EXPECTED_ID_FIELD="$ID_FIELD" python3 - <<'PYEOF' 2>>"$DIAGNOSTICS"
 import sys, re
+import os
 
 try:
     with open('api_spec.yaml') as f:
@@ -192,9 +248,10 @@ if '"422"' not in content and "'422'" not in content and '422:' not in content:
 if not re.search(r'^\s+errors\s*:', content, re.MULTILINE):
     print("Missing 'errors:' key", file=sys.stderr); sys.exit(1)
 
-# Must have userId (camelCase) as a field name
-if 'userId' not in content and 'productId' not in content and 'orderId' not in content:
-    print("Missing camelCase id field", file=sys.stderr); sys.exit(1)
+# Must have the seed-specific camelCase ID field.
+expected_id = os.environ['EXPECTED_ID_FIELD']
+if expected_id not in content:
+    print(f"Missing camelCase id field: {expected_id}", file=sys.stderr); sys.exit(1)
 
 sys.exit(0)
 PYEOF
@@ -207,7 +264,7 @@ fi
 # -------------------------------------------------------------------
 # C10: Python syntax validity (client files parseable)
 # -------------------------------------------------------------------
-if python3 - <<'PYEOF' 2>/dev/null
+if python3 - <<'PYEOF' 2>>"$DIAGNOSTICS"
 import ast, sys
 files = ['client/api.py', 'client/models.py', 'client/exceptions.py']
 for f in files:
@@ -227,12 +284,42 @@ fi
 # -------------------------------------------------------------------
 # Run full pytest (informational counts)
 # -------------------------------------------------------------------
-pytest_out=$(python3 -m pytest tests/ -q --tb=no 2>&1 || true)
-pytest_pass=$(echo "$pytest_out" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' || echo "0")
-pytest_fail=$(echo "$pytest_out" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo "0")
+set +e
+pytest_out=$(python3 -m pytest tests/ -q --tb=no 2>&1)
+pytest_status=$?
+set -e
+if [ "$pytest_status" -ne 0 ]; then
+    printf '%s\n' "$pytest_out" >>"$DIAGNOSTICS"
+fi
+pytest_counts=$(PYTEST_OUTPUT="$pytest_out" python3 - <<'PYEOF'
+import os
+import re
+
+output = os.environ["PYTEST_OUTPUT"]
+passed = re.search(r"(\d+) passed", output)
+failed = re.search(r"(\d+) failed", output)
+print(f"{passed.group(1) if passed else 0} {failed.group(1) if failed else 0}")
+PYEOF
+)
+read -r pytest_pass pytest_fail <<<"$pytest_counts"
 
 partial_score=$(awk "BEGIN {printf \"%.4f\", $partial / $total}")
 findings="${findings%,}"  # Remove trailing comma
+failure_modes_json=$(FAILURE_MODES="$failure_modes" python3 - <<'PYEOF'
+import json
+import os
+
+print(json.dumps([value for value in os.environ["FAILURE_MODES"].split(",") if value]))
+PYEOF
+)
+grader_stderr_json=$(python3 - "$DIAGNOSTICS" <<'PYEOF'
+import json
+import pathlib
+import sys
+
+print(json.dumps(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")))
+PYEOF
+)
 
 cat > "${REPORTS}/score.json" <<EOF
 {
@@ -244,7 +331,8 @@ cat > "${REPORTS}/score.json" <<EOF
     "pytest_passed": ${pytest_pass:-0},
     "pytest_failed": ${pytest_fail:-0}
   },
-  "failure_modes": [],
-  "checklist": [$findings]
+  "failure_modes": $failure_modes_json,
+  "checklist": [$findings],
+  "grader_stderr": $grader_stderr_json
 }
 EOF

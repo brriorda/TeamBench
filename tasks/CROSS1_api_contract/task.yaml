@@ -1,7 +1,7 @@
 task_id: CROSS1_api_contract
 category: Cross-System
 difficulty: hard
-languages: [python]
+languages: [python, go]
 description: "Go server + Python client with 3 field name/format mismatches to reconcile"
 tni_pattern: D
 parameterized: true

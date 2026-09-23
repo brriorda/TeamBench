@@ -8,12 +8,13 @@ RoleAgent wraps a ModelAdapter with role-specific constraints and tool access.
 This is the standard contract for running automated evaluations.
 """
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Optional
+
+import hashlib
 import json
 import os
 import subprocess
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 
 class ModelAdapter(ABC):
@@ -60,7 +61,7 @@ class ToolCallAdapter(ABC):
         raise NotImplementedError
 
 
-def tools_to_standard_declarations(tools: "list[Tool]") -> list[dict]:
+def tools_to_standard_declarations(tools: list[Tool]) -> list[dict]:
     """Convert Tool objects to a model-agnostic tool declaration format.
 
     Produces JSON-Schema-style dicts that each adapter converts to its
@@ -137,6 +138,81 @@ class Tool(ABC):
         raise NotImplementedError
 
 
+def _workspace_trace_settings(path: str) -> tuple[str, str] | None:
+    """Return trace settings when generated verifier metadata opts a task in.
+
+    Keeping trace detection at the shared tool boundary makes the same trace available to native
+    and bridged framework adapters without imposing workspace hashing on tasks that do not grade
+    action order.
+    """
+    absolute_path = os.path.abspath(path)
+    workspace_root = absolute_path
+    if os.path.basename(workspace_root) != "workspace":
+        return None
+    expected_path = os.path.join(os.path.dirname(workspace_root), "reports", "expected.json")
+    if not os.path.isfile(expected_path):
+        return None
+    with open(expected_path, "r", encoding="utf-8") as handle:
+        expected = json.load(handle)
+    if not isinstance(expected, dict):
+        raise TypeError(f"Expected verifier metadata object in {expected_path}")
+    if expected.get("trace_workspace_edits") is not True:
+        return None
+    trace_path = os.path.join(
+        os.path.dirname(workspace_root),
+        "logs",
+        "workspace_edit_trace.jsonl",
+    )
+    return workspace_root, trace_path
+
+
+def _file_sha256(path: str) -> str:
+    """Return a SHA-256 digest for one workspace file without loading it all into memory."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _snapshot_workspace(workspace_root: str) -> dict[str, str]:
+    """Capture relative file paths and content hashes for edit-trace comparison."""
+    snapshot: dict[str, str] = {}
+    for current_root, directory_names, file_names in os.walk(workspace_root):
+        directory_names[:] = [
+            name for name in directory_names if name not in {".git", "__pycache__"}
+        ]
+        for file_name in file_names:
+            absolute_path = os.path.join(current_root, file_name)
+            if os.path.islink(absolute_path) or not os.path.isfile(absolute_path):
+                continue
+            relative_path = os.path.relpath(absolute_path, workspace_root)
+            snapshot[relative_path] = _file_sha256(absolute_path)
+    return snapshot
+
+
+def _append_workspace_edit_event(
+    trace_path: str,
+    tool_name: str,
+    before: dict[str, str],
+    after: dict[str, str],
+) -> None:
+    """Append one ordered trace event when a tool changed candidate workspace files."""
+    changed_paths = sorted(
+        path for path in before.keys() | after.keys() if before.get(path) != after.get(path)
+    )
+    if not changed_paths:
+        return
+    os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+    event = {
+        "schema_version": 1,
+        "tool": tool_name,
+        "paths": changed_paths,
+    }
+    with open(trace_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
 class RunCommandTool(Tool):
     """Execute a shell command in the workspace."""
     name = "run"
@@ -145,6 +221,7 @@ class RunCommandTool(Tool):
         self.cwd = cwd
         self.allowed = allowed
         self.allowed_commands = allowed_commands
+        self.trace_settings = _workspace_trace_settings(cwd)
 
     def execute(self, cmd: str = "", **kwargs) -> ToolResult:
         if not cmd:
@@ -165,6 +242,11 @@ class RunCommandTool(Tool):
                 )
         try:
             import sys as _sys
+            before = (
+                _snapshot_workspace(self.trace_settings[0])
+                if self.trace_settings is not None
+                else {}
+            )
             run_env = os.environ.copy()
             venv_bin = os.path.dirname(os.path.abspath(_sys.executable))
             run_env["PATH"] = venv_bin + os.pathsep + run_env.get("PATH", "")
@@ -172,7 +254,12 @@ class RunCommandTool(Tool):
                 cmd, shell=True, cwd=self.cwd,
                 text=True, capture_output=True, timeout=60,
                 env=run_env,
+                check=False,
             )
+            if self.trace_settings is not None:
+                workspace_root, trace_path = self.trace_settings
+                after = _snapshot_workspace(workspace_root)
+                _append_workspace_edit_event(trace_path, self.name, before, after)
             return ToolResult(stdout=res.stdout, stderr=res.stderr, exit_code=res.returncode)
         except subprocess.TimeoutExpired:
             return ToolResult(stderr="Command timed out (60s).", exit_code=124)
@@ -206,7 +293,7 @@ class ReadFileTool(Tool):
         try:
             with open(abs_path, "r", encoding="utf-8") as f:
                 return ToolResult(stdout=f.read())
-        except Exception as e:
+        except (OSError, UnicodeError) as e:
             return ToolResult(stderr=str(e), exit_code=1)
 
 
@@ -218,6 +305,14 @@ class WriteFileTool(Tool):
         self.allowed_roots = [os.path.abspath(r) for r in allowed_roots]
         self.path_map = path_map or {}
         self.base_dir = os.path.abspath(base_dir) if base_dir else self.allowed_roots[0]
+        self.trace_settings = next(
+            (
+                settings
+                for root in self.allowed_roots
+                if (settings := _workspace_trace_settings(root)) is not None
+            ),
+            None,
+        )
 
     def _resolve(self, path: str) -> str:
         for prefix, replacement in self.path_map.items():
@@ -236,11 +331,20 @@ class WriteFileTool(Tool):
         if not any(abs_path.startswith(root) for root in self.allowed_roots):
             return ToolResult(stderr=f"Permission denied: cannot write {path}", exit_code=1)
         try:
+            before = (
+                _snapshot_workspace(self.trace_settings[0])
+                if self.trace_settings is not None
+                else {}
+            )
             os.makedirs(os.path.dirname(abs_path), exist_ok=True)
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            if self.trace_settings is not None:
+                workspace_root, trace_path = self.trace_settings
+                after = _snapshot_workspace(workspace_root)
+                _append_workspace_edit_event(trace_path, self.name, before, after)
             return ToolResult(stdout=f"Written {len(content)} bytes to {path}")
-        except Exception as e:
+        except (OSError, UnicodeError) as e:
             return ToolResult(stderr=str(e), exit_code=1)
 
 

@@ -47,6 +47,7 @@ class TerminationReason(str, Enum):
     MODEL_DONE = "model_done"
     NO_TOOL_FINAL = "no_tool_final"
     TERMINAL_TOOL = "terminal_tool"
+    OBLIGATIONS_COMPLETE = "obligations_complete"
     MAX_TURNS = "max_turns"
     STUCK_NO_TOOL = "stuck_no_tool"
     ERROR = "error"
@@ -80,6 +81,7 @@ class AgentLoopResult:
             TerminationReason.MODEL_DONE,
             TerminationReason.NO_TOOL_FINAL,
             TerminationReason.TERMINAL_TOOL,
+            TerminationReason.OBLIGATIONS_COMPLETE,
         }
 
 

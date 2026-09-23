@@ -106,6 +106,7 @@ class Generator(TaskGenerator):
             brief_md=brief_md,
             expected={
                 "mismatches_fixed": 3,
+                "entity": d["entity"],
                 "field_name": d["json_id"],
                 "pagination_key": "data",
                 "error_status": 422,

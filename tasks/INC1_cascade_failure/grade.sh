@@ -99,13 +99,28 @@ elif bug_id == 'bad_connection_string':
     for svc_cfg in cfg.get('services', {}).values():
         assert svc_cfg.get('host') != 'localhost', 'host still localhost in config'
 elif bug_id == 'missing_retry':
-    assert 'range(3)' in code or 'retry' in code.lower() or 'attempt' in code.lower(), \
-        'No retry logic found in svc_a'
+    import ast
+    tree = ast.parse(code)
+    target = next(
+        (node for node in ast.walk(tree)
+         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+         and node.name == '_call_upstream'),
+        tree,
+    )
+    has_loop = any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(target))
+    has_retry_call = any(
+        isinstance(node, ast.Call)
+        and 'retry' in (
+            node.func.id if isinstance(node.func, ast.Name)
+            else node.func.attr if isinstance(node.func, ast.Attribute)
+            else ''
+        ).lower()
+        for node in ast.walk(target)
+    )
+    assert has_loop or has_retry_call, 'No executable retry logic found in svc_a'
 elif bug_id == 'wrong_port':
     import json
     cfg = json.load(open('config.json'))
-    from generators.base import TaskGenerator  # not available in grader; use expected
-    import sys; sys.path.insert(0, '${REPORTS}/..')
     expected = json.load(open('${REPORTS}/expected.json'))
     correct_port = expected['port_b']
     actual_port = cfg['services'].get(expected['svc_b'], {}).get('port', -1)
@@ -123,60 +138,86 @@ print('ROOT_CAUSE_FIXED')
 
 # ── 6. svc_b has retry/circuit-breaker guard ────────────────────────────────
 check "python3 -c \"
+import ast
 with open('${SVC_B}.py') as f:
     code = f.read()
-has_retry = (
-    'range(3)' in code or 'range(2)' in code or
-    'retry' in code.lower() or
-    'attempt' in code.lower() or
-    'circuit' in code.lower() or
-    'for attempt' in code or
-    'for i in range' in code
+tree = ast.parse(code)
+target = next(
+    (node for node in ast.walk(tree)
+     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 'process'),
+    tree,
 )
-assert has_retry, 'No retry/circuit-breaker pattern found in svc_b'
+has_loop = any(isinstance(node, (ast.For, ast.While)) for node in ast.walk(target))
+has_guard_call = any(
+    isinstance(node, ast.Call)
+    and any(token in (
+        node.func.id if isinstance(node.func, ast.Name)
+        else node.func.attr if isinstance(node.func, ast.Attribute)
+        else ''
+    ).lower() for token in ('retry', 'circuit'))
+    for node in ast.walk(target)
+)
+assert has_loop or has_guard_call, 'No executable retry/circuit-breaker logic found in svc_b'
 print('SVC_B_RETRY_OK')
 \"" "svc_b_no_retry"
 
 # ── 7. svc_c has atomic write guard ─────────────────────────────────────────
 check "python3 -c \"
-with open('${SVC_C}.py') as f:
-    code = f.read()
-# Either raises on incomplete record, or builds entry atomically before append
-has_guard = (
-    'raise' in code or
-    'ValueError' in code or
-    'atomic' in code.lower() or
-    'if any' in code or
-    'if None' in code or
-    'is None' in code
-)
-assert has_guard, 'No partial-write guard found in svc_c'
-# Also verify store() doesn't append before all fields are set
-# Simple heuristic: _STORE.append must come after entry is fully built
-lines = code.splitlines()
-append_idx = next((i for i, l in enumerate(lines) if '_STORE.append' in l), -1)
-if append_idx >= 0:
-    pre = '\n'.join(lines[:append_idx])
-    assert 'entry[\"checksum\"]' in pre or 'checksum' in pre, \
-        'checksum may not be set before append'
+import importlib.util
+spec = importlib.util.spec_from_file_location('svc_c_guard', './${SVC_C}.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+before = len(mod.get_all())
+try:
+    mod.store({'id': 'incomplete', 'payload': 'payload'})
+except (KeyError, TypeError, ValueError):
+    pass
+else:
+    raise AssertionError('Incomplete record was accepted')
+assert len(mod.get_all()) == before, 'Incomplete record was partially committed'
+complete = {'id': 'complete', 'payload': 'payload', 'checksum': 'sha256:test'}
+mod.store(complete)
+stored = mod.get_all()
+assert len(stored) == before + 1, 'Complete record was not committed'
+assert stored[-1].get('checksum') == complete['checksum'], 'Checksum was not committed atomically'
 print('SVC_C_GUARD_OK')
 \"" "svc_c_no_atomic_guard"
 
-# ── 8. Fix order: svc_c modified before svc_b, svc_b before svc_a ───────────
-check "python3 -c \"
-import os
-ta = os.path.getmtime('${SVC_A}.py')
-tb = os.path.getmtime('${SVC_B}.py')
-tc = os.path.getmtime('${SVC_C}.py')
-# Allow any of them to be equal (modified in same second); strict: tc <= tb <= ta
-# We check that svc_a was not modified BEFORE svc_c (that would be wrong order)
-# If all were modified at the same time (bulk edit), we skip order check
-if ta != tc:
-    assert tc <= ta, f'svc_a fixed before svc_c (wrong order): tc={tc:.3f} ta={ta:.3f}'
-if tb != tc:
-    assert tc <= tb, f'svc_b fixed before svc_c (wrong order): tc={tc:.3f} tb={tb:.3f}'
+# ── 8. Required repair sequence: svc_c, then svc_b, then root cause ──────────
+EDIT_TRACE="$(dirname "$WORKSPACE")/logs/workspace_edit_trace.jsonl"
+check "python3 - '$EDIT_TRACE' '${SVC_A}.py' '${SVC_B}.py' '${SVC_C}.py' '${BUG_ID}' <<'PYEOF'
+import json
+import pathlib
+import sys
+
+trace_path, svc_a_path, svc_b_path, svc_c_path, bug_id = sys.argv[1:]
+trace_file = pathlib.Path(trace_path)
+assert trace_file.is_file(), f'Missing workspace edit trace: {trace_path}'
+
+events = []
+for line_number, line in enumerate(trace_file.read_text(encoding='utf-8').splitlines(), 1):
+    if not line.strip():
+        continue
+    event = json.loads(line)
+    assert event.get('schema_version') == 1, f'Unsupported trace schema on line {line_number}'
+    paths = event.get('paths')
+    assert isinstance(paths, list) and all(isinstance(path, str) for path in paths), \
+        f'Invalid trace paths on line {line_number}'
+    events.append(paths)
+
+def first_change(path):
+    return next((index for index, paths in enumerate(events) if path in paths), None)
+
+config_bugs = {'bad_timeout', 'bad_connection_string', 'wrong_port'}
+root_path = 'config.json' if bug_id in config_bugs else svc_a_path
+sequence = [first_change(svc_c_path), first_change(svc_b_path), first_change(root_path)]
+assert all(index is not None for index in sequence), \
+    f'Missing required edit event for C/B/root sequence: {sequence}'
+assert sequence[0] < sequence[1] < sequence[2], \
+    f'Required C -> B -> root edit order not observed: {sequence}'
 print('FIX_ORDER_OK')
-\"" "wrong_fix_order"
+PYEOF
+" "wrong_fix_order"
 
 # ── 9. Diff size not excessive ───────────────────────────────────────────────
 check "python3 -c \"

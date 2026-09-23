@@ -22,7 +22,7 @@ The grader checks:
   3. Root-cause bug in service A is fixed (source inspection + config check)
   4. Service B has retry / circuit-breaker guard (source inspection)
   5. Service C has partial-write guard (source inspection)
-  6. Fix timestamps: C modified <= B modified <= A modified
+  6. Workspace edit trace records the required C -> B -> A/root repair order
   7. Total file size not excessive (< 250 lines across all .py files)
   8. attestation.json exists with verdict=pass
 """
@@ -125,6 +125,7 @@ class Generator(TaskGenerator):
             "root_cause_service": svc_a,
             "root_cause_bug": bug_id,
             "fix_order": fix_order,
+            "trace_workspace_edits": True,
             "topology": topology,
             "expected_health_body": {"status": "ok"},
             "fix_hint": fix_hint,

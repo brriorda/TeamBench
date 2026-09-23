@@ -119,3 +119,20 @@ def test_completion_policy_receives_executed_turn_evidence(tmp_path: Path) -> No
     assert result.termination_reason is TerminationReason.TERMINAL_TOOL
     assert observed[0].role == "planner"
     assert observed[0].tool_results[0]["exit_code"] == 0
+
+
+def test_completion_policy_can_record_structural_obligation_completion(tmp_path: Path) -> None:
+    """A caller policy can stop structurally without impersonating a terminal-tool call."""
+
+    def complete(_context: CompletionContext) -> TerminationReason:
+        """End after caller-defined obligations are observed."""
+        return TerminationReason.OBLIGATIONS_COMPLETE
+
+    result = _loop(
+        tmp_path,
+        [AdapterResponse(tool_calls=[{"name": "finish_turn", "args": {}}])],
+        completion_policy=complete,
+    ).run_with_result("start")
+
+    assert result.termination_reason is TerminationReason.OBLIGATIONS_COMPLETE
+    assert result.natural is True
