@@ -504,11 +504,7 @@ from app import app as flask_app
 def reset_store():
     """Reset in-memory store before each test."""
     import app as app_module
-    for attr in dir(app_module):
-        if attr.startswith("_") and isinstance(getattr(app_module, attr), dict):
-            obj = getattr(app_module, attr)
-            if not callable(obj):
-                obj.clear()
+    getattr(app_module, "_{rs}").clear()
     yield
 
 

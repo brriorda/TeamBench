@@ -146,3 +146,18 @@ def test_seed_range_coverage():
         if seen_row_counts:
             # At minimum, check we got valid results for all seeds
             assert len(seen_row_counts) >= 1
+
+
+def test_cr4_reset_fixture_clears_only_generated_store() -> None:
+    """CR4's generated fixture must not clear module dictionaries such as builtins."""
+    from generators.gen_cr4_api_review import Generator
+
+    for seed in range(3):
+        result = Generator().generate(seed=seed)
+        test_source = result.workspace_files["tests/test_api.py"]
+        expected_clear = (
+            f'getattr(app_module, "_{result.expected["resources"]}").clear()'
+        )
+
+        assert expected_clear in test_source
+        assert "for attr in dir(app_module)" not in test_source

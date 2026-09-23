@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DIST1 grader: verify all 3 race conditions are fixed
-set -uo pipefail
+set -euo pipefail
 
 WORKSPACE="${1:-${WORKSPACE_DIR:-/workspace}}"
 REPORTS="${2:-${REPORTS_DIR:-/reports}}"
@@ -25,8 +25,9 @@ check() {
     fi
 }
 
-# Install pytest if needed
-pip install pytest 2>/dev/null || true
+# Install and verify the pytest timeout option used by the checks below.
+python3 -m pip install pytest pytest-timeout
+python3 -m pytest --help --timeout=1 >/dev/null
 
 # -------------------------------------------------------------------
 # C1: Syntax validity — queue.py and priority.py must parse
