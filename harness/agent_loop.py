@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Callable, Optional
 
 from harness.agent_interface import (
     AdapterResponse,
@@ -38,6 +39,48 @@ class AgentTurn:
     tool_calls: list[dict] = field(default_factory=list)
     tool_results: list[dict] = field(default_factory=list)
     done: bool = False
+
+
+class TerminationReason(str, Enum):
+    """Machine-readable reason why one agent-loop invocation stopped."""
+
+    MODEL_DONE = "model_done"
+    NO_TOOL_FINAL = "no_tool_final"
+    TERMINAL_TOOL = "terminal_tool"
+    MAX_TURNS = "max_turns"
+    STUCK_NO_TOOL = "stuck_no_tool"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class CompletionContext:
+    """Evidence made available to an optional caller-owned completion policy."""
+
+    response: AdapterResponse
+    tool_calls: list[dict]
+    tool_results: list[dict]
+    role: str
+    turn_index: int
+
+
+CompletionPolicy = Callable[[CompletionContext], Optional[TerminationReason]]
+
+
+@dataclass
+class AgentLoopResult:
+    """Turns plus the explicit reason the invocation stopped."""
+
+    turns: list[AgentTurn]
+    termination_reason: TerminationReason
+
+    @property
+    def natural(self) -> bool:
+        """Return whether the model or declared completion semantics ended the loop."""
+        return self.termination_reason in {
+            TerminationReason.MODEL_DONE,
+            TerminationReason.NO_TOOL_FINAL,
+            TerminationReason.TERMINAL_TOOL,
+        }
 
 
 def _truncate(s: str, limit: int) -> str:
@@ -98,13 +141,24 @@ class AgentLoop:
         log_dir: str | None = None,
         max_turns: int = 30,
         lenient_mode: bool = False,
+        completion_policy: CompletionPolicy | None = None,
+        complete_on_no_tool_final: bool = False,
+        terminal_tools: set[str] | None = None,
     ):
+        """Configure one loop while preserving legacy completion defaults.
+
+        ``completion_policy``, ``complete_on_no_tool_final``, and ``terminal_tools`` are additive;
+        callers that omit them retain the historical marker/stuck/max-turn behavior.
+        """
         self.config = role_config
         self.adapter = adapter
         self.messages_dir = messages_dir
         self.log_dir = log_dir or os.path.join("logs", role_config.role)
         self.max_turns = max_turns
         self.lenient_mode = lenient_mode
+        self.completion_policy = completion_policy
+        self.complete_on_no_tool_final = complete_on_no_tool_final
+        self.terminal_tools = frozenset(terminal_tools or ())
         self._seen_msg_count = 0
 
     def run(
@@ -122,6 +176,14 @@ class AgentLoop:
                 to the current role. Default None preserves baseline behavior for
                 every existing caller — no regression risk.
         """
+        return self.run_with_result(initial_prompt, seed_context).turns
+
+    def run_with_result(
+        self,
+        initial_prompt: str,
+        seed_context: Optional[list[dict]] = None,
+    ) -> AgentLoopResult:
+        """Execute the loop and return turns with a structured termination reason."""
         std_tools = tools_to_standard_declarations(self.config.tools)
 
         # Conversation history as plain dicts. seed_context (if any) appears first
@@ -137,6 +199,7 @@ class AgentLoop:
         max_no_tool_turns = 5 if self.lenient_mode else 3
         recent_tool_signatures: list[str] = []  # Track repeated identical calls
         max_repeated_tool = 3  # Break if same tool+args repeated N times
+        termination_reason = TerminationReason.MAX_TURNS
 
         for turn_num in range(self.max_turns):
             turn = AgentTurn(turn=turn_num, role=self.config.role)
@@ -166,6 +229,10 @@ class AgentLoop:
                 turn.text = response.text
                 if "DONE" in response.text or "TASK_COMPLETE" in response.text:
                     turn.done = True
+                    termination_reason = TerminationReason.MODEL_DONE
+            if response.done:
+                turn.done = True
+                termination_reason = TerminationReason.MODEL_DONE
 
             # Append assistant message to history
             messages.append({"role": "assistant", "content": response.text or ""})
@@ -211,7 +278,35 @@ class AgentLoop:
                     "content": "Continue, or emit DONE / TASK_COMPLETE if finished.",
                 })
 
-            # Log turn
+            completion_context = CompletionContext(
+                response=response,
+                tool_calls=list(turn.tool_calls),
+                tool_results=list(turn.tool_results),
+                role=self.config.role,
+                turn_index=turn_num,
+            )
+            policy_reason = (
+                self.completion_policy(completion_context)
+                if self.completion_policy is not None
+                else None
+            )
+            terminal_tool_used = any(
+                call.get("name") in self.terminal_tools and result.get("exit_code") == 0
+                for call, result in zip(turn.tool_calls, turn.tool_results)
+            )
+            if policy_reason is not None:
+                if not isinstance(policy_reason, TerminationReason):
+                    raise TypeError("completion_policy must return TerminationReason or None")
+                turn.done = True
+                termination_reason = policy_reason
+            elif terminal_tool_used:
+                turn.done = True
+                termination_reason = TerminationReason.TERMINAL_TOOL
+            elif self.complete_on_no_tool_final and response.text.strip() and not turn.tool_calls:
+                turn.done = True
+                termination_reason = TerminationReason.NO_TOOL_FINAL
+
+            # Log only after all completion policies have updated the turn.
             _log_turn(self.log_dir, self.config.role, turn)
             turns.append(turn)
 
@@ -250,6 +345,8 @@ class AgentLoop:
             if consecutive_no_tool >= max_no_tool_turns:
                 print(f"  [{self.config.role}] Breaking: {max_no_tool_turns} turns with no tool calls")
                 turn.done = True
+                termination_reason = TerminationReason.STUCK_NO_TOOL
+                _log_turn(self.log_dir, self.config.role, turn)
                 break
 
             # Break read loops: same tool+args repeated N times consecutively
@@ -269,4 +366,4 @@ class AgentLoop:
                     # Allow one more chance, then force-break on next repeat
                     max_repeated_tool += 2  # Raise threshold so nudge fires once
 
-        return turns
+        return AgentLoopResult(turns=turns, termination_reason=termination_reason)
