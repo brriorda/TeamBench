@@ -25,7 +25,9 @@ check() {
     fi
 }
 
-# Install and verify the pytest timeout option used by the checks below.
+# uv-created environments may not include pip; bootstrap it before installing the grader's
+# declared test dependencies, then verify the timeout option used by the checks below.
+python3 -m ensurepip --upgrade
 python3 -m pip install pytest pytest-timeout
 python3 -m pytest --help --timeout=1 >/dev/null
 

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -161,3 +162,18 @@ def test_cr4_reset_fixture_clears_only_generated_store() -> None:
 
         assert expected_clear in test_source
         assert "for attr in dir(app_module)" not in test_source
+
+
+def test_dist1_grader_bootstraps_pip_before_installing_timeout_plugin() -> None:
+    """DIST1 must support uv environments that intentionally omit the pip module."""
+    grader = (
+        Path(__file__).resolve().parents[1] / "tasks" / "DIST1_queue_race" / "grade.sh"
+    ).read_text(encoding="utf-8")
+
+    bootstrap = "python3 -m ensurepip --upgrade"
+    install = "python3 -m pip install pytest pytest-timeout"
+    preflight = "python3 -m pytest --help --timeout=1 >/dev/null"
+
+    assert bootstrap in grader
+    assert grader.index(bootstrap) < grader.index(install) < grader.index(preflight)
+    assert "|| true" not in grader
